@@ -369,6 +369,438 @@ ISA.Connector = {
     },
 
     // ════════════════════════════════════════════════════════
+    // 4. HTTP Device - Fetch from network ERPC nodes
+    // ════════════════════════════════════════════════════════
+    // Connects to ERPC web UI devices like the one at 10.0.0.109
+    // Reads config, status, and telemetry over HTTP and WebSocket
+
+    httpDevice: null,   // { host, port, telemPort, pollInterval }
+    httpPollTimer: null,
+    telemSocket: null,
+
+    connectHTTP: function(host, options) {
+        var opts = Object.assign({
+            port: 80,
+            telemPort: 8767,
+            pollInterval: 1000,
+            protocol: 'http'
+        }, options || {});
+
+        this.httpDevice = {
+            host: host,
+            port: opts.port,
+            telemPort: opts.telemPort,
+            baseUrl: opts.protocol + '://' + host + (opts.port !== 80 ? ':' + opts.port : ''),
+            telemUrl: 'ws://' + host + ':' + opts.telemPort,
+            pollInterval: opts.pollInterval
+        };
+
+        this.mode = 'http';
+        this.connected = true;
+        var self = this;
+
+        console.log('[CONNECTOR] Connecting to HTTP device at', this.httpDevice.baseUrl);
+
+        // 1. Initial fetch - read the page to discover what's there
+        this.fetchDevicePage();
+
+        // 2. Probe for API endpoints
+        this.probeDeviceAPI();
+
+        // 3. Try WebSocket telemetry
+        this.connectTelemetryWS();
+
+        // 4. Start polling
+        this.httpPollTimer = setInterval(function() {
+            self.pollDevice();
+        }, opts.pollInterval);
+
+        return true;
+    },
+
+    disconnectHTTP: function() {
+        if (this.httpPollTimer) {
+            clearInterval(this.httpPollTimer);
+            this.httpPollTimer = null;
+        }
+        if (this.telemSocket) {
+            this.telemSocket.close();
+            this.telemSocket = null;
+        }
+        this.httpDevice = null;
+        this.connected = false;
+        this.mode = 'demo';
+        console.log('[CONNECTOR] HTTP device disconnected');
+    },
+
+    // Fetch the main page and scrape it for ERPC data
+    fetchDevicePage: async function() {
+        if (!this.httpDevice) return;
+        var url = this.httpDevice.baseUrl + '/';
+        try {
+            var resp = await fetch(url, { mode: 'cors' });
+            var html = await resp.text();
+            console.log('[CONNECTOR] Device page fetched,', html.length, 'bytes');
+
+            // Parse the HTML for ERPC values
+            var parsed = this.parseDeviceHTML(html);
+            if (parsed) {
+                this.httpDevice.config = parsed;
+                this.pushData({
+                    samples: (this.data.samples || 0) + 1,
+                    vout: 0, iload: 0,
+                    error: 0, salience: 0, gradient: 0,
+                    correction: 1, entropy: parsed.erpcSettings.baseEntropy || 0,
+                    gate: parsed.status.erpc === 'ALLOW',
+                    pwm: 0,
+                    timestamp: Date.now(),
+                    source: 'http',
+                    node: parsed.status,
+                    motorSettings: parsed.motorSettings,
+                    erpcSettings: parsed.erpcSettings,
+                    networkSettings: parsed.networkSettings,
+                    raw: html.substring(0, 2000)
+                });
+            }
+            return html;
+        } catch (err) {
+            console.warn('[CONNECTOR] Fetch failed:', err.message, '- trying no-cors');
+            // Try no-cors (won't get body but confirms device is there)
+            try {
+                await fetch(url, { mode: 'no-cors' });
+                console.log('[CONNECTOR] Device reachable (opaque response via no-cors)');
+            } catch (e) {
+                console.error('[CONNECTOR] Device unreachable:', e.message);
+            }
+            return null;
+        }
+    },
+
+    // Parse the ERPC web UI HTML for settings and status values
+    parseDeviceHTML: function(html) {
+        var result = {
+            motorSettings: {},
+            erpcSettings: {},
+            networkSettings: {},
+            status: {},
+            raw: {}
+        };
+
+        // Parse input/select values: <input ... name="xxx" value="yyy">
+        var inputRegex = /<(?:input|select)[^>]*name\s*=\s*["']([^"']+)["'][^>]*value\s*=\s*["']([^"']*?)["']/gi;
+        var match;
+        while ((match = inputRegex.exec(html)) !== null) {
+            result.raw[match[1]] = match[2];
+        }
+
+        // Also try value before name
+        var inputRegex2 = /<(?:input|select)[^>]*value\s*=\s*["']([^"']*?)["'][^>]*name\s*=\s*["']([^"']+)["']/gi;
+        while ((match = inputRegex2.exec(html)) !== null) {
+            result.raw[match[2]] = match[1];
+        }
+
+        // Parse <select> with <option selected>
+        var selectRegex = /<select[^>]*name\s*=\s*["']([^"']+)["'][^>]*>[\s\S]*?<option[^>]*selected[^>]*>([^<]*)/gi;
+        while ((match = selectRegex.exec(html)) !== null) {
+            result.raw[match[1]] = match[2].trim();
+        }
+
+        // Parse checked checkboxes
+        var checkRegex = /<input[^>]*type\s*=\s*["']checkbox["'][^>]*name\s*=\s*["']([^"']+)["'][^>]*checked/gi;
+        while ((match = checkRegex.exec(html)) !== null) {
+            result.raw[match[1]] = true;
+        }
+
+        // Parse status bar text (e.g., "Node: Rotary  Axis: ROT  ERPC: ALLOW  Buf: 0/100")
+        var statusMatch = html.match(/Node:\s*(\w+)\s+Axis:\s*(\w+)\s+ERPC:\s*(\w+)\s+Buf:\s*([\d/]+)/i);
+        if (statusMatch) {
+            result.status.node = statusMatch[1];
+            result.status.axis = statusMatch[2];
+            result.status.erpc = statusMatch[3];
+            result.status.buffer = statusMatch[4];
+        }
+
+        // Map known field names to categories
+        var motorFields = ['uart_baud', 'baud', 'servo_addr', 'addr', 'max_ma', 'current',
+                           'microsteps', 'max_rpm', 'rpm', 'max_acc', 'acc', 'protection',
+                           'stall_guard', 'stallguard', 'irun', 'ihold'];
+        var erpcFields = ['base_entropy', 'baseEntropy', 'throttle_thresh', 'throttleThresh',
+                          'block_thresh', 'blockThresh', 'isolate_thresh', 'isolateThresh',
+                          'ema_alpha', 'emaAlpha', 'align_min', 'alignMin', 'throttle_ms',
+                          'throttleMs', 'entropy', 'erpc_mode'];
+        var netFields = ['telem_port', 'telemPort', 'reconnect', 'reconnect_s', 'ip', 'ssid',
+                         'hostname', 'mqtt_host', 'mqtt_port', 'ws_port'];
+
+        Object.keys(result.raw).forEach(function(key) {
+            var lower = key.toLowerCase().replace(/[-\s]/g, '_');
+            var val = result.raw[key];
+            // Try to parse numbers
+            var num = parseFloat(val);
+            var parsed = isNaN(num) ? val : num;
+
+            if (motorFields.some(function(f) { return lower.indexOf(f) >= 0; })) {
+                result.motorSettings[key] = parsed;
+            } else if (erpcFields.some(function(f) { return lower.indexOf(f) >= 0; })) {
+                result.erpcSettings[key] = parsed;
+            } else if (netFields.some(function(f) { return lower.indexOf(f) >= 0; })) {
+                result.networkSettings[key] = parsed;
+            } else {
+                // Put in most likely category based on value
+                result.motorSettings[key] = parsed;
+            }
+        });
+
+        // Scan for any number values in text nodes near known labels
+        var labelValueRegex = /(?:Base\s*Entropy|Throttle\s*Thresh|Block\s*Thresh|Isolate\s*Thresh|EMA\s*Alpha|Align\s*Min|Throttle\s*MS|Telem\s*Port|Max\s*mA|Microsteps|Max\s*RPM|Max\s*Acc|UART\s*Baud|Servo\s*Addr)[^<]*?([\d.]+)/gi;
+        while ((match = labelValueRegex.exec(html)) !== null) {
+            var label = match[0].split(/[\d]/)[0].trim().replace(/[:\s]+$/, '').replace(/\s+/g, '_').toLowerCase();
+            result.raw['_label_' + label] = parseFloat(match[1]);
+        }
+
+        console.log('[CONNECTOR] Parsed device HTML:', Object.keys(result.raw).length, 'fields,',
+            'Motor:', Object.keys(result.motorSettings).length,
+            'ERPC:', Object.keys(result.erpcSettings).length,
+            'Net:', Object.keys(result.networkSettings).length,
+            'Status:', JSON.stringify(result.status));
+
+        return result;
+    },
+
+    // Probe common API endpoints
+    probeDeviceAPI: async function() {
+        if (!this.httpDevice) return;
+        var base = this.httpDevice.baseUrl;
+        var self = this;
+        var endpoints = [
+            '/api/status', '/status', '/api/config', '/config',
+            '/api/telemetry', '/telemetry', '/api/data', '/data',
+            '/json', '/api', '/api/erpc', '/erpc',
+            '/api/motor', '/motor', '/api/info', '/info',
+            '/api/entropy', '/entropy', '/health', '/api/health',
+            '/ws', '/stream', '/events'
+        ];
+
+        this.httpDevice.apiEndpoints = {};
+
+        var probes = endpoints.map(function(ep) {
+            return fetch(base + ep, { mode: 'cors' })
+                .then(function(resp) {
+                    return resp.text().then(function(body) {
+                        if (resp.ok) {
+                            console.log('[CONNECTOR] API endpoint found:', ep, '(' + body.length + ' bytes)');
+                            self.httpDevice.apiEndpoints[ep] = {
+                                status: resp.status,
+                                contentType: resp.headers.get('content-type') || '',
+                                size: body.length,
+                                body: body.substring(0, 5000)
+                            };
+                            // Try to parse as JSON
+                            try {
+                                self.httpDevice.apiEndpoints[ep].json = JSON.parse(body);
+                            } catch (e) { /* not JSON */ }
+                        }
+                    });
+                })
+                .catch(function() { /* endpoint doesn't exist, fine */ });
+        });
+
+        await Promise.all(probes);
+        var found = Object.keys(this.httpDevice.apiEndpoints);
+        console.log('[CONNECTOR] API probe complete:', found.length, 'endpoints found', found);
+    },
+
+    // Connect to telemetry WebSocket
+    connectTelemetryWS: function() {
+        if (!this.httpDevice) return;
+        var self = this;
+        var urls = [
+            self.httpDevice.telemUrl,
+            'ws://' + self.httpDevice.host + ':' + self.httpDevice.telemPort + '/ws',
+            'ws://' + self.httpDevice.host + ':' + self.httpDevice.telemPort + '/telemetry',
+            'ws://' + self.httpDevice.host + ':81',
+            'ws://' + self.httpDevice.host + ':81/ws',
+            'ws://' + self.httpDevice.host + ':' + self.httpDevice.port + '/ws',
+            'ws://' + self.httpDevice.host + ':' + self.httpDevice.port + '/stream',
+            'ws://' + self.httpDevice.host + ':' + self.httpDevice.port + '/events'
+        ];
+
+        var tryIndex = 0;
+
+        function tryNext() {
+            if (tryIndex >= urls.length) {
+                console.log('[CONNECTOR] No WebSocket endpoints responded');
+                return;
+            }
+            var url = urls[tryIndex++];
+            console.log('[CONNECTOR] Trying WebSocket:', url);
+
+            try {
+                var ws = new WebSocket(url);
+                var timeout = setTimeout(function() {
+                    ws.close();
+                    tryNext();
+                }, 3000);
+
+                ws.onopen = function() {
+                    clearTimeout(timeout);
+                    console.log('[CONNECTOR] Telemetry WebSocket connected:', url);
+                    self.telemSocket = ws;
+                    self.httpDevice.telemConnected = true;
+                    self.httpDevice.telemUrl = url;
+                };
+
+                ws.onmessage = function(event) {
+                    var raw = event.data;
+                    // Try JSON first
+                    try {
+                        var d = JSON.parse(raw);
+                        d.timestamp = Date.now();
+                        d.source = 'telemetry-ws';
+                        self.pushData(self.normalizeTelemData(d));
+                        return;
+                    } catch (e) { /* not JSON */ }
+
+                    // Try serial format
+                    var parsed = self.parseLine(raw);
+                    if (parsed) {
+                        parsed.source = 'telemetry-ws';
+                        self.pushData(parsed);
+                        return;
+                    }
+
+                    // Try ERPC node status format
+                    var nodeData = self.parseNodeStatus(raw);
+                    if (nodeData) {
+                        self.pushData(nodeData);
+                        return;
+                    }
+
+                    // Raw data - store it
+                    console.log('[CONNECTOR] Telemetry raw:', raw.substring(0, 200));
+                    self.pushData({
+                        samples: (self.data.samples || 0) + 1,
+                        vout: 0, iload: 0, error: 0, salience: 0,
+                        gradient: 0, correction: 1, entropy: 0,
+                        gate: false, pwm: 0,
+                        timestamp: Date.now(),
+                        source: 'telemetry-ws',
+                        rawTelemetry: raw
+                    });
+                };
+
+                ws.onerror = function() {
+                    clearTimeout(timeout);
+                    tryNext();
+                };
+
+                ws.onclose = function() {
+                    if (self.httpDevice) self.httpDevice.telemConnected = false;
+                };
+            } catch (e) {
+                tryNext();
+            }
+        }
+
+        tryNext();
+    },
+
+    // Parse the node status format: "Node: Rotary  Axis: ROT  ERPC: ALLOW  Buf: 0/100"
+    parseNodeStatus: function(text) {
+        var statusMatch = text.match(/Node:\s*(\w+)\s+Axis:\s*(\w+)\s+ERPC:\s*(\w+)\s+Buf:\s*([\d]+)\/([\d]+)/i);
+        if (!statusMatch) return null;
+        return {
+            samples: (this.data.samples || 0) + 1,
+            vout: 0, iload: 0, error: 0, salience: 0,
+            gradient: 0, correction: 1,
+            entropy: 0,
+            gate: statusMatch[3] === 'ALLOW',
+            pwm: 0,
+            timestamp: Date.now(),
+            source: 'http-status',
+            node: statusMatch[1],
+            axis: statusMatch[2],
+            erpcMode: statusMatch[3],
+            bufferUsed: parseInt(statusMatch[4]),
+            bufferSize: parseInt(statusMatch[5])
+        };
+    },
+
+    // Normalize telemetry JSON to our standard data shape
+    normalizeTelemData: function(d) {
+        return {
+            samples:    d.samples   || d.sample_count || d.n || (this.data.samples || 0) + 1,
+            vout:       d.vout      || d.voltage || d.v || 0,
+            iload:      d.iload     || d.current || d.i || 0,
+            error:      d.error     || d.e || d.err || 0,
+            salience:   d.salience  || d.a || d.sal || 0,
+            gradient:   d.gradient  || d.grad || d.dS || 0,
+            correction: d.correction|| d.corr || 1,
+            entropy:    d.entropy   || d.dS || d.delta_s || d.deltaS || 0,
+            gate:       d.gate !== undefined ? !!d.gate : (d.gate_enabled || false),
+            pwm:        d.pwm       || d.duty || 0,
+            timestamp:  d.timestamp || Date.now(),
+            source:     d.source    || 'telemetry-ws',
+            // Pass through any extra ERPC node fields
+            node:       d.node      || d.name || null,
+            axis:       d.axis      || null,
+            erpcMode:   d.erpc      || d.erpc_mode || d.mode || null,
+            bufferUsed: d.buf_used  || d.buffer_used || null,
+            bufferSize: d.buf_size  || d.buffer_size || null,
+            rpm:        d.rpm       || d.speed || null,
+            position:   d.position  || d.pos || null,
+            stall:      d.stall     || d.stallguard || null
+        };
+    },
+
+    // Poll device for updates (HTTP fallback when no WebSocket)
+    pollDevice: async function() {
+        if (!this.httpDevice) return;
+        // If we have a working WebSocket, don't poll
+        if (this.httpDevice.telemConnected) return;
+
+        var base = this.httpDevice.baseUrl;
+        // Try known API endpoints first
+        var endpoints = Object.keys(this.httpDevice.apiEndpoints || {});
+        var jsonEndpoint = endpoints.find(function(ep) {
+            var info = this.httpDevice.apiEndpoints[ep];
+            return info && info.contentType && info.contentType.indexOf('json') >= 0;
+        }.bind(this));
+
+        if (jsonEndpoint) {
+            try {
+                var resp = await fetch(base + jsonEndpoint);
+                var data = await resp.json();
+                data.timestamp = Date.now();
+                data.source = 'http-poll';
+                this.pushData(this.normalizeTelemData(data));
+                return;
+            } catch (e) { /* fall through */ }
+        }
+
+        // Fallback: re-fetch the main page and parse status
+        try {
+            var resp2 = await fetch(base + '/', { mode: 'cors' });
+            var html = await resp2.text();
+            var parsed = this.parseDeviceHTML(html);
+            if (parsed && parsed.status.node) {
+                this.pushData({
+                    samples: (this.data.samples || 0) + 1,
+                    vout: 0, iload: 0, error: 0, salience: 0,
+                    gradient: 0, correction: 1,
+                    entropy: parsed.erpcSettings.base_entropy || parsed.erpcSettings.baseEntropy || 0,
+                    gate: parsed.status.erpc === 'ALLOW',
+                    pwm: 0,
+                    timestamp: Date.now(),
+                    source: 'http-poll',
+                    node: parsed.status,
+                    motorSettings: parsed.motorSettings,
+                    erpcSettings: parsed.erpcSettings
+                });
+            }
+        } catch (e) { /* device offline or CORS blocked */ }
+    },
+
+    // ════════════════════════════════════════════════════════
     // Serial Line Parser
     // ════════════════════════════════════════════════════════
     // Parses: "Samples: N | Vout: V.VVVV | Iload: I.IIIA | E: ... | A: ... | ∇S: ... | Corr: ... | ΔS: ... | Gate: ON/OFF | PWM: N"

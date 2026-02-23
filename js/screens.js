@@ -1129,9 +1129,28 @@ ISA.Screens['device-scanner'] = function() {
             html += '<td>';
             if (dev.canConnect && dev.channel === 'WebSerial') {
                 html += '<button class="filter-btn" onclick="ISA.App.connectScannedDevice(\'' + h(dev.id) + '\')" style="font-size:10px;padding:2px 8px">Connect</button>';
+            } else if (dev.canConnect && dev.channel === 'Network' && dev.host) {
+                html += '<button class="filter-btn" onclick="ISA.App.connectNetworkDevice(\'' + h(dev.host) + '\',' + (dev.port||80) + ',' + (dev.telemPort||8767) + ')" style="font-size:10px;padding:2px 8px">' + (dev.erpcSignature ? 'Connect ERPC' : 'Probe') + '</button>';
             }
             html += '</td>';
             html += '</tr>';
+            // If ERPC device with node info, show detail row
+            if (dev.erpcSignature && dev.nodeInfo) {
+                var ni = dev.nodeInfo;
+                html += '<tr><td></td><td colspan="7" style="padding:4px 10px 8px;font-size:10px">';
+                html += '<div style="display:flex;gap:16px;flex-wrap:wrap;color:var(--text-secondary)">';
+                if (ni.node) html += '<span>Node: <strong style="color:var(--color-accent)">' + h(ni.node) + '</strong></span>';
+                if (ni.axis) html += '<span>Axis: <strong>' + h(ni.axis) + '</strong></span>';
+                if (ni.erpcMode) html += '<span>ERPC: <strong style="color:' + (ni.erpcMode === 'ALLOW' ? 'var(--color-running)' : 'var(--color-warning)') + '">' + h(ni.erpcMode) + '</strong></span>';
+                if (ni.buffer) html += '<span>Buffer: <strong>' + h(ni.buffer) + '</strong></span>';
+                if (ni.telemPort) html += '<span>Telem: <strong>:' + ni.telemPort + '</strong></span>';
+                if (ni.formFields) html += '<span>' + ni.formFields + ' config fields</span>';
+                if (dev.pageSize) html += '<span>' + dev.pageSize + ' bytes</span>';
+                if (dev.matchedSignatures && dev.matchedSignatures.length > 0) {
+                    html += '<span>Signatures: ' + dev.matchedSignatures.map(function(s){return '<em>'+h(s)+'</em>';}).join(', ') + '</span>';
+                }
+                html += '</div></td></tr>';
+            }
         });
         html += '</tbody></table></div>';
     }
@@ -1221,6 +1240,10 @@ ISA.App.connectScannedDevice = function(deviceId) {
     ISA.Connector.connectSerial().then(function() {
         ISA.App.navigate('erpc-live');
     });
+};
+ISA.App.connectNetworkDevice = function(host, port, telemPort) {
+    ISA.Connector.connectHTTP(host, { port: port, telemPort: telemPort });
+    ISA.App.navigate('erpc-live');
 };
 
 console.log('[ISA] Screens loaded:', Object.keys(ISA.Screens).length, 'screens');

@@ -52,7 +52,18 @@ ISA.Scanner = {
         'GEP Algorithm',
         'Guided Entropy Principle',
         'Vout:',
-        'Gate:'
+        'Gate:',
+        'Base Entropy',
+        'Throttle Thresh',
+        'Block Thresh',
+        'Isolate Thresh',
+        'ERPC Settings',
+        'Motor Settings',
+        'Telem Port',
+        'ERPC: ALLOW',
+        'ERPC: BLOCK',
+        'ERPC: THROTTLE',
+        'ERPC: ISOLATE'
     ],
 
     // BLE service UUID for ERPC (custom 128-bit UUID)
@@ -61,6 +72,11 @@ ISA.Scanner = {
 
     // Network probe targets for local IoT devices
     NETWORK_PROBES: [
+        { host: '10.0.0.109',   port: 80,   desc: 'ERPC Node (known)' },
+        { host: '10.0.0.1',     port: 80,   desc: 'Gateway 10.x' },
+        { host: '10.0.0.100',   port: 80,   desc: '10.x static' },
+        { host: '10.0.0.110',   port: 80,   desc: '10.x neighbor' },
+        { host: '10.0.0.111',   port: 80,   desc: '10.x neighbor' },
         { host: '192.168.1.1',   port: 80,   desc: 'Gateway' },
         { host: '192.168.4.1',   port: 80,   desc: 'ESP AP default' },
         { host: '192.168.1.100', port: 80,   desc: 'Common static IP' },
@@ -528,41 +544,105 @@ ISA.Scanner = {
         var self = this;
         try {
             var controller = new AbortController();
-            var timer = setTimeout(function() { controller.abort(); }, 2000);
+            var timer = setTimeout(function() { controller.abort(); }, 3000);
 
             var start = Date.now();
-            var response = await fetch(url, {
-                method: 'HEAD',
-                mode: 'no-cors',
-                signal: controller.signal
-            });
-            clearTimeout(timer);
-            var latency = Date.now() - start;
+            // Try cors first to read content, fall back to no-cors
+            var body = null;
+            var erpcFound = false;
+            var deviceInfo = {};
+            try {
+                var corsResp = await fetch(url, { mode: 'cors', signal: controller.signal });
+                clearTimeout(timer);
+                var latency = Date.now() - start;
+                body = await corsResp.text();
 
-            // no-cors means we can't read the response, but if we got here
-            // without an abort, something responded
-            self.log('NET', probe.host + ':' + probe.port + ' responded (' + latency + 'ms) - ' + probe.desc, 'success');
+                // Deep probe: look for ERPC signatures in the page content
+                var erpcSignatures = ['ERPC', 'Entropy', 'entropy', 'erpc', 'GEP',
+                    'Base Entropy', 'Throttle Thresh', 'Block Thresh', 'Isolate Thresh',
+                    'Node:', 'Axis:', 'stallguard', 'microstep', 'Motor Settings',
+                    'ERPC Settings', 'Telem Port'];
+                var matchedSigs = [];
+                erpcSignatures.forEach(function(sig) {
+                    if (body.indexOf(sig) >= 0) {
+                        matchedSigs.push(sig);
+                        erpcFound = true;
+                    }
+                });
 
-            self.addDevice({
-                id: 'net-' + probe.host + '-' + probe.port,
-                channel: 'Network',
-                name: probe.desc + ' (' + probe.host + ')',
-                host: probe.host,
-                port: probe.port,
-                latency: latency + 'ms',
-                status: 'reachable',
-                erpcSignature: false,
-                canConnect: probe.port === 80 || probe.port === 8080
-            });
+                // Parse status bar if present
+                var statusMatch = body.match(/Node:\s*(\w+)\s+Axis:\s*(\w+)\s+ERPC:\s*(\w+)\s+Buf:\s*([\d/]+)/i);
+                if (statusMatch) {
+                    deviceInfo.node = statusMatch[1];
+                    deviceInfo.axis = statusMatch[2];
+                    deviceInfo.erpcMode = statusMatch[3];
+                    deviceInfo.buffer = statusMatch[4];
+                }
+
+                // Parse input fields for config values
+                var inputCount = (body.match(/<input/gi) || []).length;
+                var selectCount = (body.match(/<select/gi) || []).length;
+                deviceInfo.formFields = inputCount + selectCount;
+
+                // Look for telemetry port config
+                var telemMatch = body.match(/[Tt]elem(?:etry)?\s*[Pp]ort[^<]*?(\d{4,5})/);
+                if (telemMatch) deviceInfo.telemPort = parseInt(telemMatch[1]);
+
+                if (erpcFound) {
+                    self.log('NET', 'ERPC DEVICE FOUND at ' + probe.host + ':' + probe.port +
+                        ' (' + latency + 'ms) - matched: ' + matchedSigs.join(', '), 'success');
+                } else {
+                    self.log('NET', probe.host + ':' + probe.port + ' responded (' + latency + 'ms) - ' +
+                        probe.desc + ' (' + body.length + ' bytes, ' + deviceInfo.formFields + ' fields)', 'success');
+                }
+
+                self.addDevice({
+                    id: 'net-' + probe.host + '-' + probe.port,
+                    channel: 'Network',
+                    name: erpcFound
+                        ? 'ERPC Node' + (deviceInfo.node ? ': ' + deviceInfo.node : '') + ' (' + probe.host + ')'
+                        : probe.desc + ' (' + probe.host + ')',
+                    host: probe.host,
+                    port: probe.port,
+                    telemPort: deviceInfo.telemPort || null,
+                    latency: latency + 'ms',
+                    status: erpcFound ? 'ERPC detected' : 'reachable',
+                    erpcSignature: erpcFound,
+                    matchedSignatures: matchedSigs,
+                    nodeInfo: deviceInfo,
+                    pageSize: body ? body.length : 0,
+                    canConnect: true
+                });
+                return;
+
+            } catch (corsErr) {
+                // CORS blocked - try no-cors (opaque, can't read body)
+                clearTimeout(timer);
+                var controller2 = new AbortController();
+                var timer2 = setTimeout(function() { controller2.abort(); }, 2000);
+                var resp = await fetch(url, { method: 'HEAD', mode: 'no-cors', signal: controller2.signal });
+                clearTimeout(timer2);
+                var latency2 = Date.now() - start;
+
+                self.log('NET', probe.host + ':' + probe.port + ' responded (' + latency2 + 'ms, opaque/CORS) - ' + probe.desc, 'success');
+                self.addDevice({
+                    id: 'net-' + probe.host + '-' + probe.port,
+                    channel: 'Network',
+                    name: probe.desc + ' (' + probe.host + ')',
+                    host: probe.host,
+                    port: probe.port,
+                    latency: latency2 + 'ms',
+                    status: 'reachable (CORS opaque)',
+                    erpcSignature: false,
+                    canConnect: true
+                });
+            }
         } catch (err) {
             if (err.name !== 'AbortError') {
-                // Connection refused or other error means something is there but rejected
-                // AbortError means timeout (nothing responded)
                 if (err.message && err.message.indexOf('Failed to fetch') < 0) {
                     self.log('NET', probe.host + ':' + probe.port + ' - ' + err.message, 'warn');
                 }
             }
-            // Timeout = no response, don't log (too noisy)
         }
     },
 
