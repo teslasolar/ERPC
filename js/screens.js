@@ -877,4 +877,154 @@ function renderPIDSymbol(type, tag) {
     return svg;
 }
 
+// ────────────────────────────────────────────────────────────
+// ERPC LIVE Screen - Real-time sensor data
+// ────────────────────────────────────────────────────────────
+ISA.Screens['erpc-live'] = function() {
+    var conn = ISA.Connector;
+    var d = conn.data;
+    var status = conn.getStatus();
+    var html = '';
+
+    html += '<div class="screen-title">ERPC Live <span class="std-badge">SENSOR DATA</span></div>';
+    html += '<div class="screen-subtitle">Entropy-Regulated Power Control - Guided Entropy Principle (GEP) | Real-time from hardware or simulation</div>';
+
+    // Connection bar
+    html += '<div class="card" style="margin-bottom:16px;padding:12px">';
+    html += '<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">';
+    html += '<div style="display:flex;align-items:center;gap:8px">';
+    html += '<span class="status-indicator ' + (conn.connected ? 'running' : 'stopped') + '"></span>';
+    html += '<strong style="font-size:12px">' + (conn.connected ? 'CONNECTED' : 'DISCONNECTED') + '</strong>';
+    html += '<span style="color:var(--text-muted);font-size:11px">Mode: ' + h(status.mode.toUpperCase()) + '</span>';
+    html += '<span style="color:var(--text-muted);font-size:11px">Points: ' + status.dataPoints + '</span>';
+    html += '</div>';
+    html += '<div style="display:flex;gap:8px;margin-left:auto">';
+
+    if (conn.serialSupported()) {
+        if (conn.mode === 'serial' && conn.connected) {
+            html += '<button class="filter-btn active" onclick="ISA.Connector.disconnectSerial()">Disconnect Serial</button>';
+            html += '<button class="filter-btn" onclick="ISA.Connector.sendSerialCommand(\'d\')">Toggle Debug</button>';
+            html += '<button class="filter-btn" onclick="ISA.Connector.sendSerialCommand(\'r\')">Reset Counters</button>';
+        } else {
+            html += '<button class="filter-btn" onclick="ISA.Connector.connectSerial()" style="border-color:var(--color-accent);color:var(--color-accent)">&#9211; Connect USB Serial</button>';
+        }
+    } else {
+        html += '<span style="color:var(--text-muted);font-size:10px">WebSerial: Use Chrome/Edge for USB</span>';
+    }
+
+    if (conn.mode === 'demo' && !conn.connected) {
+        html += '<button class="filter-btn" onclick="ISA.Connector.startDemo()" style="border-color:var(--color-running);color:var(--color-running)">&#9654; Start Demo</button>';
+    } else if (conn.mode === 'demo' && conn.connected) {
+        html += '<button class="filter-btn active" onclick="ISA.Connector.stopDemo()">&#9632; Stop Demo</button>';
+    }
+
+    html += '<button class="filter-btn" onclick="ISA.App.exportERPC()">Export JSON</button>';
+    html += '</div></div></div>';
+
+    // GEP values - big numbers
+    html += '<div class="card-grid cols-5">';
+    var gateColor = d.gate ? 'var(--color-running)' : 'var(--color-stopped)';
+    var fields = [
+        { label: 'Vout',      value: d.vout.toFixed(3),       unit: 'V',  color: 'var(--color-accent)' },
+        { label: 'Iload',     value: d.iload.toFixed(3),      unit: 'A',  color: 'var(--color-info)' },
+        { label: 'E(t) Error',value: d.error.toFixed(4),      unit: '',   color: Math.abs(d.error) > 0.5 ? 'var(--color-alarm)' : 'var(--color-running)' },
+        { label: '\u0394S Entropy', value: d.entropy.toFixed(4), unit: '', color: Math.abs(d.entropy) > 0.5 ? 'var(--color-warning)' : 'var(--color-running)' },
+        { label: 'Gate',      value: d.gate ? 'ON' : 'OFF',   unit: 'PWM:' + d.pwm, color: gateColor }
+    ];
+    fields.forEach(function(f) {
+        html += '<div class="card stat-card">';
+        html += '<div class="stat-value" style="font-size:24px;color:' + f.color + '">' + f.value + '</div>';
+        html += '<div class="stat-label">' + h(f.label) + '</div>';
+        html += '<div class="stat-sub">' + h(f.unit) + '</div>';
+        html += '</div>';
+    });
+    html += '</div>';
+
+    // Secondary values
+    html += '<div class="card-grid cols-4" style="margin-bottom:16px">';
+    var secondary = [
+        { label: 'A(t) Salience',   value: d.salience.toFixed(4),   color: '#f0883e' },
+        { label: '|\u2207S| Gradient', value: d.gradient.toFixed(4), color: '#da3633' },
+        { label: 'Correction',      value: d.correction.toFixed(4), color: '#d29922' },
+        { label: 'Samples',         value: d.samples,               color: 'var(--text-secondary)' }
+    ];
+    secondary.forEach(function(f) {
+        html += '<div class="card" style="padding:10px;text-align:center">';
+        html += '<div style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:' + f.color + '">' + f.value + '</div>';
+        html += '<div style="font-size:10px;color:var(--text-muted);margin-top:2px">' + h(f.label) + '</div>';
+        html += '</div>';
+    });
+    html += '</div>';
+
+    // Trend canvases
+    html += '<div class="section"><div class="section-title">Voltage & Current</div>';
+    html += '<div class="card" style="padding:8px"><canvas id="trend-vi" style="width:100%;height:180px"></canvas></div></div>';
+
+    html += '<div class="split-layout">';
+    html += '<div class="section"><div class="section-title">GEP Signals</div>';
+    html += '<div class="card" style="padding:8px"><canvas id="trend-gep" style="width:100%;height:180px"></canvas></div></div>';
+
+    html += '<div class="section"><div class="section-title">Entropy Field & Gate</div>';
+    html += '<div class="card" style="padding:8px"><canvas id="trend-entropy" style="width:100%;height:180px"></canvas></div></div>';
+    html += '</div>';
+
+    // GEP Equation reference
+    html += '<div class="section"><div class="section-title">GEP Algorithm Reference</div>';
+    html += '<div class="info-box">';
+    html += '<strong>Guided Entropy Principle (GEP)</strong> - Gary W. Floyd, Lumiea Systems Research<br><br>';
+    html += '<div style="font-family:var(--font-mono);font-size:12px;line-height:2">';
+    html += '<strong>E(t)</strong> = V<sub>ref</sub> - V<sub>out</sub> &nbsp;&nbsp;&nbsp; <span style="color:var(--text-muted)">// Error signal</span><br>';
+    html += '<strong>A(t)</strong> = |P(t) - P(t-1)| &nbsp;&nbsp;&nbsp; <span style="color:var(--text-muted)">// Salience (power change rate)</span><br>';
+    html += '<strong>|\u2207S(t)|</strong> = |V(t) - V(t-1)| &nbsp;&nbsp;&nbsp; <span style="color:var(--text-muted)">// Gradient (voltage change rate)</span><br>';
+    html += '<strong>Correction</strong> = 1 + \u03B1\u00B7A(t) - \u03B2\u00B7|\u2207S(t)| &nbsp;&nbsp;&nbsp; <span style="color:var(--text-muted)">// \u03B1=0.3, \u03B2=0.5</span><br>';
+    html += '<strong>\u0394S(t)</strong> = E(t) \u00D7 Correction &nbsp;&nbsp;&nbsp; <span style="color:var(--text-muted)">// Entropy field</span><br>';
+    html += '<strong>Gate</strong> = |\u0394S(t)| > Threshold &nbsp;&nbsp;&nbsp; <span style="color:var(--text-muted)">// Threshold=0.5V &rarr; switch or skip</span><br>';
+    html += '</div>';
+    html += '<div style="margin-top:8px;color:var(--text-muted);font-size:11px">"The math is already done. This is just plugging in connections." - GWF</div>';
+    html += '</div></div>';
+
+    // After render, schedule canvas drawing
+    requestAnimationFrame(function() { ISA.App.drawERPCTrends(); });
+
+    return html;
+};
+
+// Called after ERPC screen renders to draw the canvas trends
+ISA.App = ISA.App || {};
+ISA.App.drawERPCTrends = function() {
+    var hist = ISA.Connector.history;
+    if (hist.time.length < 2) return;
+
+    // Voltage & Current
+    ISA.TrendCanvas.draw('trend-vi', [
+        { data: hist.vout,  color: '#58a6ff', label: 'Vout',  width: 2 },
+        { data: hist.iload, color: '#2ea043', label: 'Iload', width: 1.5 }
+    ], { title: 'Vout (V) / Iload (A)', autoScale: true });
+
+    // GEP Signals
+    ISA.TrendCanvas.draw('trend-gep', [
+        { data: hist.error,      color: '#da3633', label: 'E(t)',   width: 1.5 },
+        { data: hist.salience,   color: '#f0883e', label: 'A(t)',   width: 1 },
+        { data: hist.gradient,   color: '#d29922', label: '\u2207S', width: 1 },
+        { data: hist.correction, color: '#8b949e', label: 'Corr',   width: 1, alpha: 0.6 }
+    ], { title: 'GEP Components', autoScale: true });
+
+    // Entropy & Gate
+    ISA.TrendCanvas.draw('trend-entropy', [
+        { data: hist.entropy, color: '#58a6ff', label: '\u0394S', width: 2 },
+        { data: hist.gate.map(function(g) { return g ? 1 : 0; }), color: '#2ea043', label: 'Gate', width: 1.5 }
+    ], { title: 'Entropy Field / Gate State', autoScale: true });
+};
+
+ISA.App.exportERPC = function() {
+    var json = ISA.Connector.exportHistory();
+    var blob = new Blob([json], { type: 'application/json' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'erpc-data-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+    a.click();
+    URL.revokeObjectURL(url);
+};
+
 console.log('[ISA] Screens loaded:', Object.keys(ISA.Screens).length, 'screens');

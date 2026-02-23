@@ -5,7 +5,10 @@
 
 window.ISA = window.ISA || {};
 
-ISA.App = {
+// Preserve any functions already attached to ISA.App (from screens.js)
+var _existingApp = ISA.App || {};
+
+ISA.App = Object.assign({
     currentScreen: 'dashboard',
     updateTimer: null,
 
@@ -16,6 +19,10 @@ ISA.App = {
         this.navigate('dashboard');
         ISA.Simulation.start();
         ISA.Simulation.onTick(this.onSimTick.bind(this));
+
+        // Wire up ERPC connector for live screen updates
+        this.setupConnector();
+
         console.log('[APP] Ready. Standards loaded. Gary, your system is online.');
     },
 
@@ -58,6 +65,36 @@ ISA.App = {
         } else {
             container.innerHTML = '<div class="screen-title">Screen Not Found</div><div class="screen-subtitle">Screen "' + screenId + '" is not available.</div>';
         }
+    },
+
+    // ── ERPC Connector ─────────────────────────────────────
+    setupConnector: function() {
+        var self = this;
+        // Listen for connector data and refresh ERPC Live screen
+        ISA.Connector.onData(function() {
+            if (self.currentScreen === 'erpc-live') {
+                // Throttle DOM updates to 5Hz for smooth canvas rendering
+                if (self._lastERPCRender && Date.now() - self._lastERPCRender < 200) {
+                    // Just redraw the canvases without full DOM re-render
+                    if (self.drawERPCTrends) self.drawERPCTrends();
+                    return;
+                }
+                self._lastERPCRender = Date.now();
+                var main = document.getElementById('main-content');
+                var scrollTop = main ? main.scrollTop : 0;
+                self.renderScreen('erpc-live');
+                if (main) main.scrollTop = scrollTop;
+            }
+        });
+
+        // Update footer connection status
+        ISA.Connector.onData(function(d) {
+            var scanEl = document.getElementById('scan-rate');
+            if (scanEl && ISA.Connector.connected && ISA.Connector.mode !== 'demo') {
+                scanEl.textContent = ISA.Connector.mode.toUpperCase() + ' LIVE';
+                scanEl.style.color = 'var(--color-running)';
+            }
+        });
     },
 
     // ── Simulation tick handler ────────────────────────────
@@ -126,7 +163,6 @@ ISA.App = {
 
     // ── Clock ──────────────────────────────────────────────
     startClock: function() {
-        var self = this;
         function updateClock() {
             var now = new Date();
             var dateEl = document.getElementById('header-date');
@@ -137,7 +173,7 @@ ISA.App = {
         updateClock();
         setInterval(updateClock, 1000);
     }
-};
+}, _existingApp);
 
 // ── Boot ───────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', function() {
