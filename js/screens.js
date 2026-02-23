@@ -1027,4 +1027,200 @@ ISA.App.exportERPC = function() {
     URL.revokeObjectURL(url);
 };
 
+// ────────────────────────────────────────────────────────────
+// DEVICE SCANNER Screen
+// ────────────────────────────────────────────────────────────
+ISA.Screens['device-scanner'] = function() {
+    var scanner = ISA.Scanner;
+    var caps = scanner.getCapabilities();
+    var html = '';
+
+    html += '<div class="screen-title">Device Scanner <span class="std-badge">DISCOVERY</span></div>';
+    html += '<div class="screen-subtitle">Scan for ERPC devices and ISA-compatible sensors across all available channels</div>';
+
+    // Capabilities bar
+    html += '<div class="card" style="margin-bottom:16px;padding:12px">';
+    html += '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">';
+
+    var channels = [
+        { key: 'serial',    label: 'WebSerial',    icon: '&#9211;' },
+        { key: 'usb',       label: 'WebUSB',       icon: '&#9783;' },
+        { key: 'bluetooth', label: 'Bluetooth LE',  icon: '&#9784;' },
+        { key: 'nfc',       label: 'Web NFC',       icon: '&#9889;' },
+        { key: 'mqtt',      label: 'MQTT/WS',       icon: '&#9729;' },
+        { key: 'network',   label: 'Network',        icon: '&#9881;' }
+    ];
+    channels.forEach(function(ch) {
+        var avail = caps[ch.key];
+        html += '<div style="display:flex;align-items:center;gap:4px;padding:4px 8px;border-radius:3px;background:' + (avail ? 'rgba(46,160,67,0.1)' : 'rgba(139,148,158,0.1)') + ';font-size:11px">';
+        html += '<span class="status-indicator ' + (avail ? 'running' : 'stopped') + '"></span>';
+        html += '<span style="color:' + (avail ? 'var(--color-running)' : 'var(--text-muted)') + '">' + ch.label + '</span>';
+        html += '</div>';
+    });
+
+    if (!caps.secure) {
+        html += '<div style="color:var(--color-warning);font-size:10px;margin-left:8px">&#9888; HTTPS required for WebSerial/USB/BLE - serve via GitHub Pages or localhost</div>';
+    }
+    html += '</div></div>';
+
+    // Scan buttons
+    html += '<div class="section"><div class="section-title">Scan Controls</div>';
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">';
+
+    html += '<button class="filter-btn" onclick="ISA.App.runScanAll()" style="border-color:var(--color-accent);color:var(--color-accent);font-weight:600">';
+    html += (scanner.scanning ? '&#9211; Scanning...' : '&#9654; Scan All Channels');
+    html += '</button>';
+
+    if (caps.serial) {
+        html += '<button class="filter-btn" onclick="ISA.App.runScanSerial()">&#9211; Pair Serial Port</button>';
+    }
+    if (caps.usb) {
+        html += '<button class="filter-btn" onclick="ISA.App.runScanUSB()">&#9783; Authorize USB</button>';
+    }
+    if (caps.bluetooth) {
+        html += '<button class="filter-btn" onclick="ISA.App.runScanBLE()">&#9784; Scan BLE</button>';
+    }
+
+    html += '<button class="filter-btn" onclick="ISA.App.runScanMQTT()">&#9729; MQTT Discovery</button>';
+    html += '<button class="filter-btn" onclick="ISA.App.runScanRange()">&#9881; Scan IP Range</button>';
+    html += '<button class="filter-btn" onclick="ISA.Scanner.clearDevices();ISA.App.navigate(\'device-scanner\')" style="color:var(--text-muted)">Clear</button>';
+    html += '</div></div>';
+
+    // Discovered devices table
+    html += '<div class="section"><div class="section-title">Discovered Devices <span class="section-badge">' + scanner.devices.length + ' found</span></div>';
+    if (scanner.devices.length === 0) {
+        html += '<div class="card" style="padding:40px;text-align:center;color:var(--text-muted)">';
+        html += '<div style="font-size:40px;margin-bottom:12px">&#9211;</div>';
+        html += '<div style="font-size:14px;margin-bottom:4px">No devices discovered yet</div>';
+        html += '<div style="font-size:11px">Click "Scan All Channels" to search for ERPC devices<br>or use individual channel buttons above</div>';
+        html += '</div>';
+    } else {
+        html += '<div class="scroll-container" style="max-height:400px">';
+        html += '<table class="data-table"><thead><tr>';
+        html += '<th></th><th>Device</th><th>Channel</th><th>IDs</th><th>Status</th><th>ERPC</th><th>Found</th><th>Action</th>';
+        html += '</tr></thead><tbody>';
+
+        scanner.devices.forEach(function(dev) {
+            var erpcColor = dev.erpcSignature ? 'var(--color-running)' : 'var(--text-muted)';
+            var statusColor = dev.status.indexOf('ERPC') >= 0 ? 'var(--color-running)' :
+                              dev.status === 'reachable' || dev.status === 'connected' || dev.status === 'found' || dev.status === 'paired' ? 'var(--color-accent)' :
+                              dev.status === 'listening' ? 'var(--color-info)' : 'var(--text-secondary)';
+
+            html += '<tr>';
+            html += '<td><span class="status-indicator ' + (dev.status === 'ERPC detected' ? 'running' : dev.canConnect ? 'running' : 'stopped') + '"></span></td>';
+            html += '<td class="tag-name">' + h(dev.name) + '</td>';
+            html += '<td>' + h(dev.channel) + '</td>';
+            html += '<td class="mono" style="font-size:10px">';
+            if (dev.vendorId) html += 'VID:' + dev.vendorId + ' ';
+            if (dev.productId) html += 'PID:' + dev.productId + ' ';
+            if (dev.host) html += dev.host + ':' + dev.port + ' ';
+            if (dev.bleId) html += 'BLE:' + dev.bleId.substring(0, 8) + '... ';
+            if (dev.latency) html += '(' + dev.latency + ')';
+            html += '</td>';
+            html += '<td style="color:' + statusColor + '">' + h(dev.status) + '</td>';
+            html += '<td style="text-align:center">';
+            if (dev.erpcSignature) {
+                html += '<span style="color:var(--color-running);font-weight:700">&#10003; ERPC</span>';
+            } else {
+                html += '<span style="color:var(--text-muted)">-</span>';
+            }
+            html += '</td>';
+            html += '<td style="font-size:10px;color:var(--text-muted)">' + h(dev.discoveredAt || '') + '</td>';
+            html += '<td>';
+            if (dev.canConnect && dev.channel === 'WebSerial') {
+                html += '<button class="filter-btn" onclick="ISA.App.connectScannedDevice(\'' + h(dev.id) + '\')" style="font-size:10px;padding:2px 8px">Connect</button>';
+            }
+            html += '</td>';
+            html += '</tr>';
+        });
+        html += '</tbody></table></div>';
+    }
+    html += '</div>';
+
+    // Scan log
+    html += '<div class="section"><div class="section-title">Scan Log <span class="section-badge">' + scanner.scanLog.length + ' entries</span></div>';
+    html += '<div class="card scroll-container" style="max-height:250px;padding:0;font-family:var(--font-mono);font-size:11px">';
+    if (scanner.scanLog.length === 0) {
+        html += '<div style="padding:16px;color:var(--text-muted);text-align:center">No scan activity yet</div>';
+    }
+    scanner.scanLog.forEach(function(entry) {
+        var color = entry.level === 'success' ? 'var(--color-running)' :
+                    entry.level === 'warn' ? 'var(--color-warning)' :
+                    entry.level === 'error' ? 'var(--color-alarm)' : 'var(--text-secondary)';
+        var prefix = entry.level === 'success' ? '[+]' : entry.level === 'warn' ? '[!]' : entry.level === 'error' ? '[x]' : '[-]';
+        html += '<div style="padding:3px 10px;border-bottom:1px solid var(--border);display:flex;gap:8px">';
+        html += '<span style="color:var(--text-muted);min-width:60px">' + h(entry.time) + '</span>';
+        html += '<span style="color:var(--color-accent);min-width:60px;font-weight:600">' + h(entry.channel) + '</span>';
+        html += '<span style="color:' + color + '">' + prefix + ' ' + h(entry.message) + '</span>';
+        html += '</div>';
+    });
+    html += '</div></div>';
+
+    // How it works
+    html += '<div class="section"><div class="section-title">How Device Discovery Works</div>';
+    html += '<div class="card-grid cols-3">';
+    var howItWorks = [
+        { ch: 'WebSerial', desc: 'Enumerates USB serial ports paired with the browser. Opens port at 115200 baud, sends "?" command, reads response looking for ERPC signature strings like "Entropy-Regulated Power Control" or "GEP Algorithm".', req: 'Chrome/Edge, HTTPS' },
+        { ch: 'WebUSB', desc: 'Queries USB devices authorized by the user. Matches vendor/product IDs against known Arduino, ESP32, CH340, FTDI, and CP210x chips. Can authorize new devices through the browser picker.', req: 'Chrome/Edge, HTTPS' },
+        { ch: 'Bluetooth LE', desc: 'Scans for BLE devices and checks for ERPC custom service UUID. Reads device information service for manufacturer and firmware details. Can connect to HM-10, BT05, or ESP32 BLE modules.', req: 'Chrome/Edge, HTTPS' },
+        { ch: 'MQTT/WS', desc: 'Connects to an MQTT broker over WebSocket and subscribes to erpc/discovery/# topic. Devices announce themselves with JSON payloads containing deviceId, name, type, and topic info.', req: 'Any browser' },
+        { ch: 'Network Probe', desc: 'Sends fetch requests to common local IP addresses and mDNS hostnames (erpc.local, arduino.local, esp32.local). Uses timing to detect responding hosts. Can scan custom IP ranges.', req: 'Any browser' },
+        { ch: 'Web NFC', desc: 'Reads NFC tags containing ERPC configuration data. Tags can store device IDs, WiFi credentials, MQTT broker URLs, or calibration data. Tap tag to phone to read.', req: 'Chrome Android' }
+    ];
+    howItWorks.forEach(function(item) {
+        html += '<div class="card">';
+        html += '<div class="card-title" style="margin-bottom:4px;color:var(--color-accent)">' + h(item.ch) + '</div>';
+        html += '<div class="card-body">' + h(item.desc) + '</div>';
+        html += '<div style="margin-top:6px;font-size:10px;color:var(--text-muted)">Requires: ' + h(item.req) + '</div>';
+        html += '</div>';
+    });
+    html += '</div></div>';
+
+    return html;
+};
+
+// Scanner action handlers
+ISA.App.runScanAll = async function() {
+    await ISA.Scanner.scanAll();
+    ISA.App.navigate('device-scanner');
+};
+ISA.App.runScanSerial = async function() {
+    await ISA.Scanner.requestSerialPort();
+    ISA.App.navigate('device-scanner');
+};
+ISA.App.runScanUSB = async function() {
+    await ISA.Scanner.requestUSBDevice();
+    ISA.App.navigate('device-scanner');
+};
+ISA.App.runScanBLE = async function() {
+    await ISA.Scanner.scanBLE();
+    ISA.App.navigate('device-scanner');
+};
+ISA.App.runScanMQTT = function() {
+    var broker = prompt('MQTT Broker WebSocket URL:', 'wss://broker.hivemq.com:8884/mqtt');
+    if (broker) {
+        ISA.Scanner.scanMQTT(broker, 'erpc/discovery/#');
+        setTimeout(function() { ISA.App.navigate('device-scanner'); }, 1000);
+    }
+};
+ISA.App.runScanRange = function() {
+    var base = prompt('Base IP (e.g., 192.168.1):', '192.168.1');
+    if (!base) return;
+    var start = parseInt(prompt('Start host number:', '1'), 10);
+    var end = parseInt(prompt('End host number:', '20'), 10);
+    if (isNaN(start) || isNaN(end)) return;
+    ISA.Scanner.scanRange(base, start, end, 80).then(function() {
+        ISA.App.navigate('device-scanner');
+    });
+};
+ISA.App.connectScannedDevice = function(deviceId) {
+    var device = ISA.Scanner.devices.find(function(d) { return d.id === deviceId; });
+    if (!device || !device.port) return;
+    // Hand off the port to the connector and navigate to ERPC Live
+    ISA.Connector.port = device.port;
+    ISA.Connector.connectSerial().then(function() {
+        ISA.App.navigate('erpc-live');
+    });
+};
+
 console.log('[ISA] Screens loaded:', Object.keys(ISA.Screens).length, 'screens');
